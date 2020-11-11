@@ -1,0 +1,6 @@
+octD OK
+boxD OK
+polkaRll buggy (falls into bottom on satisfactory constraints at initialization)
+polkaMPQ slow
+t1pMPFR buggy (double-free when free abstract1)
+t1pMPQ buggy (free invalid pointer at environment_change)

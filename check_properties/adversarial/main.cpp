@@ -17,8 +17,18 @@
 #include "File.h"
 #include "Reluplex.h"
 #include "MString.h"
+#include "absEle.h"
+#include "absEngine.h"
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include "Log.h"
+#include "matrix.h"
 
-const char *FULL_NET_PATH = "./nnet/ACASXU_run2a_1_1_batch_2000.nnet";
+using namespace std;
+
+
+
 
 struct Index
 {
@@ -143,9 +153,8 @@ void got_signal( int )
     }
 }
 
-bool advMain( int argc, char **argv, unsigned inputPoint, double inputDelta, unsigned runnerUp )
+bool advMain( int argc, char **argv, unsigned inputPoint, double inputDelta, unsigned runnerUp, String networkPath)
 {
-    String networkPath = FULL_NET_PATH;
     char *finalOutputFile;
 
     if ( argc < 2 )
@@ -174,6 +183,70 @@ bool advMain( int argc, char **argv, unsigned inputPoint, double inputDelta, uns
 
     getFixedInputs( fixedInputs, inputPoint );
     getFixedOutputs( fixedInputs, fixedOutputs, outputLayerSize, neuralNetwork );
+    timeval AIstart = Time::sampleMicro();
+	if(AION){
+		std::ofstream obounds("bounds.txt");
+		obounds<<"";
+		obounds.close();
+		Log_info("Build an Acas network");
+		Dnn *adnn = new Dnn(Acas, networkPath.ascii());
+		Log_info("Get the dims in the input layer");
+		int inputDim = adnn->get_inputdim();
+		std::cout<<"dim is"<<inputDim<<std::endl;
+		Log_info("Build an engine based on abstract interpretation with an Acas network");
+		AbsEngine *aeng = new AbsEngine(adnn);
+		std::vector<std::string> name(inputDim);
+		int i;
+		for(i = 0; i < inputDim; i++){
+		    name[i] =  "dim" + std::to_string(i);
+		}
+		Log_info("Introduce contriants on inputs");
+		double *mins = adnn->get_mins();
+		double *maxes = adnn->get_maxes();
+	
+		Matrix amatrix(inputDim);
+	
+	// Set bounds for inputs
+		for ( unsigned i = 0; i < inputLayerSize ; ++i )
+	 	   {
+			double realMax =
+			    ( neuralNetwork._network->maxes[i] - neuralNetwork._network->means[i] )
+		    / ( neuralNetwork._network->ranges[i] );
+			double realMin =
+			    ( neuralNetwork._network->mins[i] - neuralNetwork._network->means[i] )
+			    / ( neuralNetwork._network->ranges[i] );
+		
+			double min = fixedInputs[i] - inputDelta;
+			if ( min < realMin )
+		 	   min = realMin;
+		
+			double max = fixedInputs[i] + inputDelta;
+			if ( max > realMax )
+			    max = realMax;
+		
+			amatrix.set_lowerbound(i,min);
+			amatrix.set_uperbound(i,max);
+	 	   }
+
+		double **coffs = amatrix.get_coff();
+		double **bias = amatrix.get_bias();
+		LogicOP *lop =  amatrix.get_lop();
+		int num = amatrix.get_num();
+		std::cout<<"num of cons is "<<num<<std::endl;
+		std::cout<<"before building an absele"<<std::endl;
+		AbsEle *aele = new AbsEle(inputDim,name,DOMT,num,coffs,lop,bias);
+		std::cout<<"after building an absele, the ales is "<< std::endl;
+	
+		aeng->iterateWholeNet(aele);
+		std::cout<<"computation finished"<<std::endl;
+		//std::cout<<*aele<<std::endl;
+		std::cout<<"unsplit is "<<unsplit<<std::endl;
+		std::cout<<"split is "<<split<<std::endl;
+   	 }
+    timeval AIend = Time::sampleMicro();
+    
+
+   
 
     unsigned minimal;
     findMinimal( fixedOutputs, minimal );
@@ -195,10 +268,20 @@ bool advMain( int argc, char **argv, unsigned inputPoint, double inputDelta, uns
     //   3. Each output var has an instance and an auxiliary var for its equation
     //   4. A single variable for the output constraints
     //   5. A single variable for the constants
-    Reluplex reluplex( inputLayerSize + ( 3 * numReluNodes ) + ( 2 * outputLayerSize ) + 1 + 1,
-                       finalOutputFile,
-                       Stringf( "Point_%u_Delta_%.5lf_runnerUp_%u", inputPoint, inputDelta, runnerUp ) );
+    String runner_type;
+    if (AION) {
+	runner_type = "AI";
+	if (DOMT == TOPO) runner_type = runner_type + "TOPO";
+	else runner_type = runner_type + "BOXSym";
+    }
+    else{
+    	runner_type = "AIOFF";
+    }
 
+   unsigned AImilliPassed = Time::timePassed( AIstart, AIend );
+   Reluplex reluplex( inputLayerSize + ( 3 * numReluNodes ) + ( 2 * outputLayerSize ) + 1 + 1,
+                       finalOutputFile,
+			   Stringf( "%s_Point_%u_Delta_%.5lf_runnerUp_%u, Type: %s, AItime %s,", networkPath.ascii(),inputPoint, inputDelta, runnerUp, runner_type.ascii(),milliToString(AImilliPassed).ascii()) );
     lastReluplex = &reluplex;
 
     Map<Index, unsigned> nodeToVars;
@@ -281,6 +364,42 @@ bool advMain( int argc, char **argv, unsigned inputPoint, double inputDelta, uns
     // so we want it to be positive - i.e., runner up scored lower.
     reluplex.setLowerBound( outputSlackVar, 0.0 );
     reluplex.markBasic( outputSlackVar );
+    memset(absLowerB,0,sizeof(double)*10000);
+    memset(absUpperB,0,sizeof(double)*10000);
+    memset(absFlag,0,sizeof(int)*10000);
+    if(AION){
+	ifstream ibounds("bounds.txt",std::ios::in);
+	for ( unsigned i = 1; i < numLayersInUse -1 ; ++i ){
+	    for ( unsigned j = 0; j < neuralNetwork.getLayerSize( i ); ++j ){
+		    unsigned b = nodeToVars[Index(i, j, false)];
+		    unsigned f = nodeToVars[Index(i, j, true)];
+		    reluplex.setReluPair( b, f );
+		    double inf,sup;
+		    ibounds>> inf >> sup;
+		    reluplex.setLowerBound( f,std::max(0.0,inf));
+		    reluplex.setUpperBound( f,std::max(0.0,sup));
+		    reluplex.setLowerBound( b,inf);
+		    reluplex.setUpperBound( b,sup);
+		    // absFlag[b] = 1;
+		    // absFlag[f] = 2;
+		    // absLowerB[b] = inf;
+		    // absLowerB[f] = inf;
+		    // absUpperB[b] = sup;
+		    // absUpperB[f] = sup;
+		    
+		    
+		    
+		    cout << "ABS,\t Layer \t" << i-1 << ",\tNode \t" << j <<",\t"
+			 << b << ",\t" << f <<",\t"
+			//<< std::scientific
+			 << std::setprecision (std::numeric_limits<double>::digits10 + 1)
+			 <<inf << ",\t" << sup ;
+		    cout << endl;
+	    }
+	}
+	ibounds.close();
+    }
+else{
 
     // Declare relu pairs and set bounds
     for ( unsigned i = 1; i < numLayersInUse - 1; ++i )
@@ -291,10 +410,11 @@ bool advMain( int argc, char **argv, unsigned inputPoint, double inputDelta, uns
             unsigned f = nodeToVars[Index(i, j, true)];
 
             reluplex.setReluPair( b, f );
-            reluplex.setLowerBound( f, 0.0 );
+
+	    reluplex.setLowerBound( f, 0.0 );
         }
     }
-
+}
     printf( "Number of auxiliary variables: %u\n", nodeToAux.size() );
 
     // Mark all aux variables as basic and set their bounds to zero
@@ -437,11 +557,28 @@ bool advMain( int argc, char **argv, unsigned inputPoint, double inputDelta, uns
     unsigned minutes = seconds / 60;
     unsigned hours = minutes / 60;
 
+ 
+
     printf( "Total run time: %u milli (%02u:%02u:%02u)\n",
             Time::timePassed( start, end ), hours, minutes - ( hours * 60 ), seconds - ( minutes * 60 ) );
 
 	return sat;
 }
+
+// int main(){
+//     String networkPath = FULL_NET_PATH;
+//     AcasNeuralNetwork neuralNetwork( networkPath.ascii() );
+//     unsigned numLayersInUse = neuralNetwork.getNumLayers() + 1;
+//     unsigned outputLayerSize = neuralNetwork.getLayerSize( numLayersInUse - 1 );
+//     Vector<double>  fixedInputs = { -0.10000, 
+// 				    0.027465, 
+// 				    -0.000703,
+// 				    0.053843,
+// 				    -0.10000};
+//     Vector<double> fixedOutputs;
+//     neuralNetwork.evaluate( fixedInputs, fixedOutputs, outputLayerSize );
+//     return 0;
+// }
 
 int main( int argc, char **argv )
 {
@@ -450,26 +587,27 @@ int main( int argc, char **argv )
     sa.sa_handler = got_signal;
     sigfillset( &sa.sa_mask );
     sigaction( SIGQUIT, &sa, NULL );
-
+    
     List<unsigned> points = { 0, 1, 2, 3, 4 };
     List<double> deltas = { 0.1, 0.075, 0.05, 0.025, 0.01 };
-
-    for ( const auto &point : points )
-    {
-        for ( const auto &delta : deltas )
-        {
+    
+    assert(argc >=5);
+    char* net = argv[2];
+    unsigned point = atoi(argv[3]);
+    double delta = atof(argv[4]);
+    // List<unsigned> points = { 0 };
+    // List<double> deltas = { 0.1 };
             bool sat = false;
             unsigned i = 0;
-            while ( ( !sat ) && ( i < 4 ) )
+	    String netPath(net);
+            while ( ( !sat ) && ( i < 1 ) )
             {
                 printf( "Performing test for point %u, delta = %.5lf, part %u\n", point, delta, i + 1 );
-                sat = advMain( argc, argv, point, delta, i );
+                sat = advMain( argc, argv, point, delta, i, netPath);
                 printf( "Test for point %u, delta = %.5lf, part %u DONE. Result = %s\n", point, delta, i + 1, sat ? "SAT" : "UNSAT" );
                 printf( "\n\n" );
                 ++i;
             }
-        }
-    }
 
     return 0;
 }
